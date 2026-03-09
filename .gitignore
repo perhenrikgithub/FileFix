@@ -1,0 +1,14 @@
+# Build output
+/target/
+
+# Editor files
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+
+# Generated files
+**/*.rs.bk
