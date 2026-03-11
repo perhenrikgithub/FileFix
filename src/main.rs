@@ -24,7 +24,6 @@ use std::process::Command;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-
 // ==========================================
 // 0. FORMAT VALIDATIONS & DEFINITIONS
 // ==========================================
@@ -97,8 +96,6 @@ struct Config {
 // MAIN ROUTER
 // ==========================================
 fn main() {
-    
-
     let config_path = dirs::home_dir().unwrap().join(".filefix/config.toml");
     let default_folder = load_default_folder(&config_path);
 
@@ -373,16 +370,15 @@ fn engine_convert(files: Vec<PathBuf>, convert_to: &str, delete_original: bool, 
         let output_file = if overwrite { file.with_extension(convert_to) } else { unique_output_path(&file, convert_to) };
         pb.set_message(file.file_name().unwrap().to_string_lossy().to_string());
 
-        let mut success = false;
+        let mut result: Result<(), String> = Err("Unsupported conversion type".to_string());
 
         if IMAGE_TYPES.contains(&input_ext_norm.as_str()) {
             // ImageMagick Pipeline
-            success = Command::new("magick")
-                .arg(&file)
-                .arg(&output_file)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            match Command::new("magick").arg(&file).arg(&output_file).output() {
+                Ok(out) if out.status.success() => result = Ok(()),
+                Ok(out) => result = Err(extract_error_reason(&out)),
+                Err(e) => result = Err(e.to_string()),
+            }
 
         } else if DOC_TYPES.contains(&input_ext_norm.as_str()) && convert_to == "pdf" {
             // LibreOffice Pipeline
@@ -396,25 +392,27 @@ fn engine_convert(files: Vec<PathBuf>, convert_to: &str, delete_original: bool, 
             fs::create_dir_all(&temp_work_dir).ok();
             let env_arg = format!("-env:UserInstallation=file://{}", to_file_url(&temp_work_dir.join("profile")));
 
-            let res = Command::new(get_soffice_cmd())
+            match Command::new(get_soffice_cmd())
                 .arg(&env_arg)
                 .args(["--headless", "--convert-to", "pdf"])
                 .arg(&file)
                 .arg("--outdir")
                 .arg(&temp_work_dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            if res {
-                let generated_out = temp_work_dir.join(file.file_stem().unwrap()).with_extension("pdf");
-                if generated_out.exists() {
-                    if fs::copy(&generated_out, &output_file).is_ok() {
-                        success = true;
+                .output() {
+                Ok(out) if out.status.success() => {
+                    let generated_out = temp_work_dir.join(file.file_stem().unwrap()).with_extension("pdf");
+                    if generated_out.exists() {
+                        if fs::copy(&generated_out, &output_file).is_ok() {
+                            result = Ok(());
+                        } else {
+                            result = Err("LibreOffice generated the PDF, but failed to copy it".to_string());
+                        }
+                    } else {
+                        result = Err("LibreOffice succeeded but no output PDF was found".to_string());
                     }
-                }
+                },
+                Ok(out) => result = Err(extract_error_reason(&out)),
+                Err(e) => result = Err(e.to_string()),
             }
             let _ = fs::remove_dir_all(&temp_work_dir);
 
@@ -428,33 +426,103 @@ fn engine_convert(files: Vec<PathBuf>, convert_to: &str, delete_original: bool, 
             let temp_work_dir = std::env::temp_dir().join(format!("filefix_jup_{}", hash));
             fs::create_dir_all(&temp_work_dir).ok();
 
-            let res = Command::new("jupyter")
-                .args(["nbconvert", "--to", "pdf"])
-                .arg(&file)
-                .arg("--output-dir")
-                .arg(&temp_work_dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let jupyter_bin = get_venv_bin("jupyter");
+            let python_bin = get_venv_bin("python");
 
-            if res {
-                let generated_out = temp_work_dir.join(file.file_stem().unwrap()).with_extension("pdf");
-                if generated_out.exists() {
-                    if fs::copy(&generated_out, &output_file).is_ok() {
-                        success = true;
-                    }
+            // Re-usable custom executor using OUR ISOLATED VENV
+            let run_custom_html_to_pdf = || -> Result<(), String> {
+                // Step 1: Export to HTML using JupyterLab template (Modern UI + MathJax 3)
+                let html_out = Command::new(&jupyter_bin)
+                    .args(["nbconvert", "--to", "html", "--template", "lab"])
+                    .arg(&file)
+                    .arg("--output-dir")
+                    .arg(&temp_work_dir)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if !html_out.status.success() {
+                    return Err(format!("HTML Generation failed: {}", extract_error_reason(&html_out)));
+                }
+
+                let html_file_path = temp_work_dir.join(file.file_stem().unwrap()).with_extension("html");
+                if !html_file_path.exists() {
+                    return Err("HTML file was not generated by nbconvert.".to_string());
+                }
+
+                // Step 2: Use Playwright explicitly to render the PDF and WAIT for MathJax
+                let py_script = r#"
+import sys, os
+from playwright.sync_api import sync_playwright
+
+html_file = f"file://{os.path.abspath(sys.argv[1])}"
+pdf_file = sys.argv[2]
+
+with sync_playwright() as p:
+    # Disable web security to allow local HTML to fetch MathJax from CDNs
+    browser = p.chromium.launch(args=["--disable-web-security"])
+    page = browser.new_page()
+    page.goto(html_file, wait_until="networkidle")
+    
+    # Wait for MathJax to finish rendering equations (2.5 seconds)
+    page.wait_for_timeout(2500)
+    
+    page.emulate_media(media="print")
+    page.pdf(path=pdf_file, format="A4", print_background=True, margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"})
+    browser.close()
+"#;
+                let script_path = temp_work_dir.join("render_pdf.py");
+                fs::write(&script_path, py_script).map_err(|e| e.to_string())?;
+
+                let pdf_out = Command::new(&python_bin)
+                    .arg(&script_path)
+                    .arg(&html_file_path)
+                    .arg(&output_file)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if !pdf_out.status.success() {
+                    return Err(format!("Playwright PDF rendering failed: {}", extract_error_reason(&pdf_out)));
+                }
+
+                Ok(())
+            };
+
+            // 1. FIRST TRY: Custom HTML -> Playwright pipeline (Ensures MathJax works)
+            result = run_custom_html_to_pdf();
+
+            // 2. FALLBACK: standard ipynb -> latex -> PDF (if the HTML route crashes entirely)
+            if let Err(err_html) = &result {
+                let fallback_out = Command::new(&jupyter_bin)
+                    .args(["nbconvert", "--to", "pdf"])
+                    .arg(&file)
+                    .arg("--output-dir")
+                    .arg(&temp_work_dir)
+                    .output();
+                
+                match fallback_out {
+                    Ok(out) if out.status.success() => {
+                        let generated_out = temp_work_dir.join(file.file_stem().unwrap()).with_extension("pdf");
+                        if generated_out.exists() && fs::copy(&generated_out, &output_file).is_ok() {
+                            result = Ok(());
+                        }
+                    },
+                    Ok(out) => result = Err(format!("HTML->PDF err: {} | LaTeX->PDF err: {}", err_html, extract_error_reason(&out))),
+                    Err(e) => result = Err(format!("HTML->PDF err: {} | LaTeX->PDF err: {}", err_html, e)),
                 }
             }
             let _ = fs::remove_dir_all(&temp_work_dir);
         }
 
-        if success {
-            if delete_original { fs::remove_file(&file).ok(); }
-            if safe_open { open_file(&output_file); }
-        } else {
-            pb.println(format!("⚠️ Failed to convert: {:?}", file.file_name().unwrap()));
+        // --- Execute file handling ---
+        match result {
+            Ok(_) => {
+                if delete_original { fs::remove_file(&file).ok(); }
+                if safe_open { open_file(&output_file); }
+            }
+            Err(e) => {
+                // Now displays WHY it failed
+                pb.println(format!("⚠️ Failed to convert {:?}: {}", file.file_name().unwrap(), e));
+            }
         }
 
         pb.inc(1);
@@ -467,6 +535,52 @@ fn engine_convert(files: Vec<PathBuf>, convert_to: &str, delete_original: bool, 
 // ==========================================
 // HELPER FUNCTIONS
 // ==========================================
+
+fn extract_error_reason(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    let err_lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let all_lines: Vec<&str> = stderr.lines().chain(stdout.lines()).filter(|l| !l.trim().is_empty()).collect();
+    
+    // Python Tracebacks & System errors usually push their final reason to stderr
+    let target_lines = if !err_lines.is_empty() { err_lines } else { all_lines };
+    
+    if target_lines.is_empty() {
+        return "Unknown error (No output provided by underlying tool)".to_string();
+    }
+    
+    // Grab the last line (which for Python stack traces is usually the core Exception)
+    let last_line = target_lines.last().unwrap().trim();
+    
+    // Cap at a reasonable line limit to not break UI formatting
+    let max_len = 100;
+    if last_line.len() > max_len {
+        format!("{}...", &last_line[..max_len])
+    } else {
+        last_line.to_string()
+    }
+}
+
+fn get_venv_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not find home directory")
+        .join(".filefix")
+        .join("venv")
+}
+
+fn get_venv_bin(binary: &str) -> PathBuf {
+    let venv = get_venv_path();
+    #[cfg(target_os = "windows")]
+    {
+        venv.join("Scripts").join(format!("{}.exe", binary))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        venv.join("bin").join(binary)
+    }
+}
+
 fn load_default_folder(config_path: &PathBuf) -> PathBuf {
     if config_path.exists() {
         if let Ok(conf) = toml::from_str::<Config>(&fs::read_to_string(config_path).unwrap_or_default()) {
@@ -525,6 +639,59 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn ensure_python_venv() -> Result<(), String> {
+    let venv_path = get_venv_path();
+    let marker_file = venv_path.join(".setup_complete");
+
+    // If the marker exists, the venv is fully set up and ready to go
+    if marker_file.exists() && get_venv_bin("jupyter").exists() {
+        return Ok(());
+    }
+
+    println!("⚠️ Jupyter dependencies not found. Setting up Python environment...");
+    println!("If this is the first time you're converting notebooks, this setup is required to enable PDF conversion. This is a one-time setup.");
+    println!("\n⏳ [1/4] Creating dedicated Python environment for FileFix...");
+    let system_python = if command_exists("python3") { "python3" } else { "python" };
+    
+    let status = Command::new(system_python)
+        .args(["-m", "venv"])
+        .arg(&venv_path)
+        .status()
+        .map_err(|e| format!("Failed to execute python: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to create Python virtual environment. Do you have python3-venv installed?".to_string());
+    }
+
+    println!("⏳ [2/4] Installing Jupyter and WebPDF dependencies (this may take a minute)...");
+    let pip_exe = get_venv_bin("pip");
+    let status = Command::new(&pip_exe)
+        .args(["install", "-q", "jupyter", "nbconvert[webpdf]", "playwright"])
+        .status()
+        .map_err(|e| format!("Failed to run pip: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to install Python dependencies via pip.".to_string());
+    }
+
+    println!("⏳ [3/4] Installing headless browser for PDF conversion...");
+    let playwright_exe = get_venv_bin("playwright");
+    let status = Command::new(&playwright_exe)
+        .args(["install", "chromium"])
+        .status()
+        .map_err(|e| format!("Failed to run playwright: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to install Playwright Chromium browser.".to_string());
+    }
+
+    // Mark as successfully completed
+    fs::write(&marker_file, "done").ok();
+    println!("✅ [4/4] Setup complete! Resuming conversion...\n");
+
+    Ok(())
+}
+
 fn ensure_dependencies(files: &[PathBuf]) {
     let mut needs_magick = false;
     let mut needs_soffice = false;
@@ -540,24 +707,27 @@ fn ensure_dependencies(files: &[PathBuf]) {
     let mut missing = vec![];
 
     if needs_magick && !command_exists("magick") {
-        missing.push("ImageMagick (magick)");
+        missing.push("ImageMagick (magick)".to_string());
     }
 
     if needs_soffice && !command_exists(get_soffice_cmd()) {
-        missing.push("LibreOffice (soffice)");
+        missing.push("LibreOffice (soffice)".to_string());
     }
 
-    if needs_jupyter && !command_exists("jupyter") {
-        missing.push("Jupyter (nbconvert)");
+    if needs_jupyter {
+        if !command_exists("python3") && !command_exists("python") {
+            missing.push("Python (python3 or python) - Required to build Jupyter environment".to_string());
+        } else if let Err(e) = ensure_python_venv() {
+            missing.push(format!("Jupyter Environment Setup Failed: {}", e));
+        }
     }
 
     if !missing.is_empty() {
-        println!("\n❌ Missing required dependencies:");
+        println!("\n❌ Missing required dependencies or setups:");
         for m in missing {
             println!("  • {}", m);
         }
-
-        println!("\nPlease install the missing tools and try again.");
+        println!("\nPlease resolve the above issues and try again.");
         std::process::exit(1);
     }
 }
